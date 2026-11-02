@@ -96,6 +96,7 @@ jobs:
                   body_path: .github/release_body.md
                   target_commitish: ${{ github.sha }}
                   prerelease: true
+                  make_latest: false
                   files: |
                       PiliPala-*.apk
 
