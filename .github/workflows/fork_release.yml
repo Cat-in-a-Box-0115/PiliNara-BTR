@@ -1,0 +1,242 @@
+name: Fork Sync & Release
+
+# 每周跟进 tyechan/PiliNara 的最新正式版，合并本 fork 的 iPad BTR 改动，
+# 构建 Android + iOS 并发布为本仓库的正式 Release，供应用内更新使用。
+# 只发布 fork 自己的改动时，需先在 pubspec.yaml 提高 versionCode，否则应用内不会提示更新。
+
+on:
+  schedule:
+    - cron: "37 10 * * 1"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Delete and republish the release for the current upstream version"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: tyechan/PiliNara
+
+jobs:
+  sync:
+    name: Sync upstream
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.merge.outputs.build }}
+      tag: ${{ steps.upstream.outputs.tag }}
+      upstream_tag: ${{ steps.upstream.outputs.upstream_tag }}
+      sha: ${{ steps.merge.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          # 上游改动 .github/workflows 时，GITHUB_TOKEN 无权推送；可配置带 workflow 权限的 SYNC_TOKEN
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Find latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release=$(gh api "repos/$UPSTREAM_REPO/releases/latest")
+          upstream_tag=$(jq -er '.tag_name' <<< "$release")
+          commitish=$(jq -er '.target_commitish' <<< "$release")
+          tag="${upstream_tag%%+*}-ipad"
+          echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
+          echo "commitish=$commitish" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream: $upstream_tag ($commitish) -> $tag"
+
+      - name: Merge upstream into main
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+          COMMITISH: ${{ steps.upstream.outputs.commitish }}
+        run: |
+          if existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" 2>/dev/null); then
+            usable=$(jq -r '(.draft | not) and (.prerelease | not)
+              and ([.assets[].name | select(endswith(".apk"))] | length) >= 3
+              and ([.assets[].name | select(endswith("_ios.ipa"))] | length) >= 1' <<< "$existing")
+            if [ "$usable" = "true" ] && [ "$FORCE" != "true" ]; then
+              echo "release $TAG already published, nothing to do"
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "removing release $TAG (force=$FORCE usable=$usable)"
+            gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag -y
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898+github-actions[bot]@users.noreply.github.com"
+          git fetch "https://github.com/$UPSTREAM_REPO.git" "$COMMITISH"
+          if ! git merge --no-edit -m "merge $UPSTREAM_REPO $UPSTREAM_TAG" FETCH_HEAD; then
+            echo "::error::Merge conflict with $UPSTREAM_TAG, resolve manually"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          git push origin main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+  android:
+    name: Build Android
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "17"
+          cache: "gradle"
+          cache-dependency-path: |
+            android/*.gradle*
+            android/**/gradle-wrapper.properties
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Apply Flutter patches
+        shell: pwsh
+        run: lib/scripts/patch.ps1 android
+
+      - name: Write key
+        env:
+          SIGN_KEYSTORE_BASE64: ${{ secrets.SIGN_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$SIGN_KEYSTORE_BASE64" ]; then
+            echo "::error::SIGN_KEYSTORE_BASE64 is not set; releases must use a stable key"
+            exit 1
+          fi
+          echo "$SIGN_KEYSTORE_BASE64" | base64 --decode > android/app/key.jks
+          {
+            echo "storeFile=key.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > android/key.properties
+
+      - name: Set fork version
+        run: bash lib/scripts/build_fork.sh
+
+      - name: Build APK
+        run: flutter build apk --release --split-per-abi --build-name="${{ env.version_name }}" --build-number="${{ env.version_code }}" --dart-define-from-file=pili_release.json --pub
+
+      - name: Rename
+        shell: bash
+        run: |
+          for file in build/app/outputs/flutter-apk/app-*-release.apk; do
+            abi=$(echo "$file" | sed -E 's|.*app-(.*)-release\.apk|\1|')
+            mv "$file" "PiliNara-BTR-${{ env.version_name }}-${{ env.version_code }}_${abi}.apk"
+          done
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: PiliNara-BTR-*.apk
+
+  ios:
+    name: Build iOS
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: pubspec.yaml
+
+      - name: Set fork version
+        run: bash lib/scripts/build_fork.sh
+
+      - name: Apply Flutter patches
+        shell: pwsh
+        run: lib/scripts/patch.ps1 iOS
+
+      - name: Build IPA
+        run: |
+          flutter build ios --release --no-codesign --build-name="${{ env.version_name }}" --build-number="${{ env.version_code }}" --dart-define-from-file=pili_release.json --no-pub
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/Runner.app
+          # make AltSign / SideStore happy
+          find Payload/Runner.app/Frameworks -type d -name "*.framework" -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
+          zip -qr9 "PiliNara-BTR-${{ env.version_name }}-${{ env.version_code }}_ios.ipa" Payload
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios
+          path: PiliNara-BTR-*_ios.ipa
+
+  release:
+    name: Publish release
+    needs: [sync, android, ios]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release notes
+        run: |
+          codes=$(ls dist/*.apk dist/*.ipa | sed -nE 's/.*-([0-9]{10})_[^/]*$/\1/p' | sort -u)
+          if [ "$(echo "$codes" | wc -l)" -ne 1 ] || [ -z "$codes" ]; then
+            echo "::error::unexpected version codes: $codes"
+            ls dist
+            exit 1
+          fi
+          code=$codes
+          echo "code=$code" >> "$GITHUB_ENV"
+          cat > notes.md <<EOF
+          Based on [${{ env.UPSTREAM_REPO }} ${{ needs.sync.outputs.upstream_tag }}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ needs.sync.outputs.upstream_tag }}), with the BTR multi-thread proxy enabled on iOS/iPadOS.
+
+          - Android: pick the APK matching your device (arm64-v8a for most phones)
+          - iOS / iPadOS: unsigned IPA, install with SideStore / AltStore
+          EOF
+
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.sync.outputs.tag }}
+          name: PiliNara-BTR ${{ needs.sync.outputs.tag }} (${{ env.code }})
+          body_path: notes.md
+          target_commitish: ${{ needs.sync.outputs.sha }}
+          prerelease: false
+          make_latest: true
+          files: dist/*

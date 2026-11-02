@@ -26,9 +26,8 @@ jobs:
           channel: stable
           flutter-version-file: pubspec.yaml
 
-      - name: Set and Extract version
-        shell: pwsh
-        run: lib/scripts/build.ps1
+      - name: Set fork version
+        run: bash lib/scripts/build_fork.sh
 
       - name: Apply Patch
         shell: pwsh
@@ -36,7 +35,7 @@ jobs:
 
       - name: Build iOS
         run: |
-          flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub
+          flutter build ios --release --no-codesign --build-name="${{ env.version_name }}" --build-number="${{ env.version_code }}" --dart-define-from-file=pili_release.json --no-pub
           ln -sf ./build/ios/iphoneos Payload
           # make AltSign happy...
           find Payload/Runner.app/Frameworks -type d -name "*.framework" -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
