@@ -87,6 +87,31 @@ class VodHttpProxy {
     }
   }
 
+  void _dropServer(HttpServer server, String reason) {
+    if (!identical(_server, server)) return;
+    VodProxyLog.log('listener lost reason=$reason');
+    _server = null;
+    port = null;
+    unawaited(server.close(force: true).catchError((_) {}));
+  }
+
+  /// 从后台恢复时确认监听 socket 仍可连接，否则丢弃以便重新绑定
+  Future<void> verifyListener() async {
+    final server = _server;
+    final p = port;
+    if (server == null || p == null) return;
+    try {
+      final socket = await Socket.connect(
+        InternetAddress.loopbackIPv4,
+        p,
+        timeout: const Duration(milliseconds: 500),
+      );
+      socket.destroy();
+    } catch (e) {
+      _dropServer(server, 'resume-check $e');
+    }
+  }
+
   Future<bool> ensureStarted() async {
     if (isRunning) return true;
     try {
@@ -94,9 +119,14 @@ class VodHttpProxy {
       server.autoCompress = false;
       _server = server;
       port = server.port;
-      server.listen((request) {
-        unawaited(_handle(request));
-      });
+      server.listen(
+        (request) {
+          unawaited(_handle(request));
+        },
+        // iOS 可能在挂起期间回收监听 socket：失效后下次 wrap() 重新绑定
+        onError: (Object e) => _dropServer(server, 'error $e'),
+        onDone: () => _dropServer(server, 'done'),
+      );
       var threads = 6;
       var chunkKb = 512;
       var windowMb = 32;
