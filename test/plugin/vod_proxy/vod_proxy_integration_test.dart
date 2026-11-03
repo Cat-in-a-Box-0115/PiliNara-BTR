@@ -196,6 +196,34 @@ void main() {
     expect(got, payload);
   }, timeout: const Timeout(Duration(seconds: 25)));
 
+  test('startup does not wait for the slowest probe host', () async {
+    final slow = _MockCdn(
+      payload,
+      slowAt: 0,
+      slowFor: const Duration(milliseconds: 2500),
+      advertiseHost: '127.0.0.1',
+    );
+    final fast = _MockCdn(payload, advertiseHost: 'localhost');
+    await slow.start();
+    await fast.start();
+    addTearDown(slow.stop);
+    addTearDown(fast.stop);
+    final sw = Stopwatch()..start();
+    final proxyUrl = await VodHttpProxy.instance.openRaw(
+      fast.url,
+      extras: [slow.url],
+      chunkSize: 16 * 1024,
+      windowBytes: 64 * 1024,
+      workers: 2,
+    );
+    final openedIn = sw.elapsed;
+    expect(proxyUrl, isNotNull);
+    // 以前要等最慢节点的 2.5s 探测结束才返回
+    expect(openedIn, lessThan(const Duration(milliseconds: 1500)));
+    final got = await _fetchAll(proxyUrl!).timeout(const Duration(seconds: 20));
+    expect(got, payload);
+  }, timeout: const Timeout(Duration(seconds: 25)));
+
   test('mid-response chunk timeout still serves the full file', () async {
     final cdn = _MockCdn(
       payload,
