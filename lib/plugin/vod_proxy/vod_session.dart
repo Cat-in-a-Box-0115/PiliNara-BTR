@@ -65,6 +65,9 @@ class VodSession {
   final Set<int> _fetchedChunks = {};
   final Set<int> _servedChunks = {};
   int? fileSize;
+
+  /// 任一探测拿到文件大小即完成，起播不必等最慢的节点
+  final Completer<void> _sizeKnown = Completer<void>();
   int _cursor = 0;
   int _highWater = 0;
   int _bytesDelivered = 0;
@@ -222,7 +225,9 @@ class VodSession {
       }
       return known;
     }
-    await _probeHosts().timeout(timeout, onTimeout: () {});
+    final probes = _probeHosts();
+    await Future.any<void>([probes, _sizeKnown.future])
+        .timeout(timeout, onTimeout: () {});
     if (fileSize != null && fileSize! > 0) return fileSize!;
     final probeEnd = chunkSize < 4096 ? chunkSize : 4096;
     final probe = await _fetchRange(
@@ -241,7 +246,11 @@ class VodSession {
     return size;
   }
 
-  Future<void> _probeHosts() async {
+  /// 并发调用共享同一轮探测，避免第二个调用者立即返回而提前走兜底
+  Future<void>? _probeRun;
+  Future<void> _probeHosts() => _probeRun ??= _runProbes();
+
+  Future<void> _runProbes() async {
     if (_probed || _closed) return;
     _probed = true;
     final targets = pool.hosts.take(8).toList();
@@ -257,6 +266,11 @@ class VodSession {
             probe: true,
           ).timeout(const Duration(seconds: 3));
           fileSize ??= result.total;
+          if (fileSize != null && fileSize! > 0 && !_sizeKnown.isCompleted) {
+            // 首个成功节点即可起播，先按已测速节点修正海外/大陆排序
+            pool.markOverseasWinnerIfNeeded();
+            _sizeKnown.complete();
+          }
           final thruMbps = stat.emaBps * 8 / 1e6;
           if (kind == 'video') {
             VodHostHealth.instance.noteVideoProbe(
@@ -305,6 +319,14 @@ class VodSession {
     _cursor = start;
     if (start > _highWater) _highWater = start;
     _evict();
+    // 起播块先以 urgent 发起，否则会被预取以普通超时占位
+    final size = fileSize;
+    if (size != null && start < size) {
+      unawaited(
+        _chunk(start ~/ chunkSize, urgent: true)
+            .then<void>((_) {}, onError: (_) {}),
+      );
+    }
     unawaited(_prefetch(start));
     try {
       var pos = start;

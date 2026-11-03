@@ -308,6 +308,19 @@ class VodHttpProxy {
     );
     final videoSession = _sessions[videoId];
     if (videoSession == null) return null;
+    // 视频、音频并行探测，起播等待取两者较慢者而非两者之和
+    String? audioId;
+    if (source.audioSource case final a? when a.isNotEmpty) {
+      audioId = _register(
+        kind: 'audio',
+        primary: a,
+        extras: source.audioCandidates,
+      );
+    }
+    final audioSession = audioId == null ? null : _sessions[audioId];
+    final audioSize = audioSession?.ensureSize();
+    // 视频失败时提前返回，避免音频探测的错误无人处理
+    audioSize?.ignore();
     try {
       await videoSession.ensureSize();
     } catch (e) {
@@ -316,25 +329,27 @@ class VodHttpProxy {
       videoSession.close(reason: 'probe-failed');
       _sessions.remove(videoId);
       _currentVideoId = null;
+      if (audioId != null) {
+        audioSession?.close(reason: 'probe-failed');
+        _sessions.remove(audioId);
+        _currentAudioId = null;
+      }
       return null;
     }
     String? audio;
     if (source.audioSource case final a? when a.isNotEmpty) {
-      final audioId = _register(
-        kind: 'audio',
-        primary: a,
-        extras: source.audioCandidates,
-      );
-      final audioSession = _sessions[audioId];
       try {
-        await audioSession!.ensureSize();
-        audio = _url(audioId);
+        if (audioSession == null || audioSize == null) {
+          throw StateError('audio session missing');
+        }
+        await audioSize;
+        audio = _url(audioId!);
         _currentAudioId = audioId;
       } catch (e) {
         VodProxyLog.log('probe-failed audio $e — using direct audio');
         audioSession?.fallbackReason = e.toString();
         audioSession?.close(reason: 'probe-failed');
-        _sessions.remove(audioId);
+        if (audioId != null) _sessions.remove(audioId);
         audio = a;
         _currentAudioId = null;
       }

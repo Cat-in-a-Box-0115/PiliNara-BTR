@@ -26,6 +26,15 @@ if [[ "$pubCode" != "$versionCode" ]]; then
   exit 1
 fi
 
+# fork 发布可传入更大的 versionCode，使只含 fork 改动的构建也能触发应用内更新
+if [[ -n "${FORK_VERSION_CODE:-}" ]]; then
+  if (( FORK_VERSION_CODE < versionCode )); then
+    echo "FORK_VERSION_CODE=$FORK_VERSION_CODE is lower than pubspec $versionCode" >&2
+    exit 1
+  fi
+  versionCode=$FORK_VERSION_CODE
+fi
+
 commitHash=$(git rev-parse HEAD)
 shortHash=${commitHash:0:7}
 buildTime=$(date +%s)

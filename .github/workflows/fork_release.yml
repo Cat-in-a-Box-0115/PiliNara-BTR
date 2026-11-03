@@ -2,7 +2,7 @@ name: Fork Sync & Release
 
 # 每周跟进 tyechan/PiliNara 的最新正式版，合并本 fork 的 iPad BTR 改动，
 # 构建 Android + iOS 并发布为本仓库的正式 Release，供应用内更新使用。
-# 只发布 fork 自己的改动时，需先在 pubspec.yaml 提高 versionCode，否则应用内不会提示更新。
+# versionCode 取上游与当前日期小时的较大值，fork 自己的改动用 force 重新发布即可触发应用内更新。
 
 on:
   schedule:
@@ -34,6 +34,7 @@ jobs:
       tag: ${{ steps.upstream.outputs.tag }}
       upstream_tag: ${{ steps.upstream.outputs.upstream_tag }}
       sha: ${{ steps.merge.outputs.sha }}
+      code: ${{ steps.merge.outputs.code }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -88,6 +89,12 @@ jobs:
           fi
           git push origin main
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # versionCode = max(上游 pubspec, 当天日期+小时)，保证每次发布都比上次大
+          upstream_code=$(sed -nE 's/^version:[^+]*\+([0-9]+).*/\1/p' pubspec.yaml | head -1)
+          date_code=$(date -u +%Y%m%d%H)
+          if (( upstream_code > date_code )); then code=$upstream_code; else code=$date_code; fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "version code: $code (upstream $upstream_code)"
           echo "build=true" >> "$GITHUB_OUTPUT"
 
   android:
@@ -143,6 +150,8 @@ jobs:
           } > android/key.properties
 
       - name: Set fork version
+        env:
+          FORK_VERSION_CODE: ${{ needs.sync.outputs.code }}
         run: bash lib/scripts/build_fork.sh
 
       - name: Build APK
@@ -181,6 +190,8 @@ jobs:
           flutter-version-file: pubspec.yaml
 
       - name: Set fork version
+        env:
+          FORK_VERSION_CODE: ${{ needs.sync.outputs.code }}
         run: bash lib/scripts/build_fork.sh
 
       - name: Apply Flutter patches
