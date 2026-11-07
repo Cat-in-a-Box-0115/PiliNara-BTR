@@ -239,6 +239,9 @@ class PlaybackDiag {
     }
   }
 
+  /// 已出首帧（或进度已推进）
+  bool get firstFrameSeen => _loggedFirstFrame;
+
   bool get sawNullSurfaceRecently {
     final at = _nullSurfaceAt;
     return at != null &&

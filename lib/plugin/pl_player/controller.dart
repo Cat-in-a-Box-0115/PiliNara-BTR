@@ -228,6 +228,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   AutoAudioOnlyState _autoAudioState = AutoAudioOnlyState.idle;
   Timer? _autoAudioOnlyTimer;
   bool _audioReopened = false;
+
+  // 起播前切到后台的处理，均以 _sourceGen 标识所属的 setDataSource
+  /// 尚未开始播放的 gen
+  int _startGen = -1;
+  /// 已选定要打开的 Media（视频或纯音频）的 gen
+  int _committedGen = -1;
+  /// player.open 已完成的 gen
+  int _openedGen = -1;
+  /// open 完成后需关闭视频轨的 gen
+  int _bgVideoOffGen = -1;
   AppLifecycleState? _lastAppLifecycleState;
   bool _autoAudioRestoreInProgress = false;
   int _autoAudioRestoreGeneration = 0;
@@ -1103,6 +1113,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       if (_vodProxyPlatform && !isLive) {
         VodHttpProxy.instance.closeAll(reason: 'media-change');
       }
+      if (gen == _sourceGen) {
+        _startGen = gen;
+        _bgVideoOffGen = -1;
+      }
       // 初始化数据加载状态
       dataStatus.value = DataStatus.loading;
       // 初始化全屏方向
@@ -1180,6 +1194,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       onInit?.call();
     } catch (err, stackTrace) {
       dataStatus.value = DataStatus.error;
+      if (gen == _sourceGen) {
+        _startGen = -1;
+        _bgVideoOffGen = -1;
+      }
       if (kDebugMode) {
         debugPrint(stackTrace.toString());
         debugPrint('plPlayer err:  $err');
@@ -1402,6 +1420,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       }
     }
 
+    // 已在后台时起播：Android 没有渲染 surface，视频解码会初始化失败，只打开音频
+    if (gen != null &&
+        gen == _sourceGen &&
+        gen == _startGen &&
+        _inBackground &&
+        _canStartAudioOnlyInBackground()) {
+      onlyPlayAudio.value = true;
+      _audioReopened = true;
+      _autoAudioState = AutoAudioOnlyState.autoAudioOnly;
+      VodProxyLog.play('bg-start audio-only at open');
+    }
+    if (gen != null && gen == _sourceGen) _committedGen = gen;
     String video = playSource.videoSource;
     if (playSource.audioSource case final audio? when (audio.isNotEmpty)) {
       if (onlyPlayAudio.value) {
@@ -1427,6 +1457,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       Media(video, start: seekTo, extras: extras.isEmpty ? null : extras),
       play: false,
     );
+    if (gen != null && gen == _sourceGen) {
+      _openedGen = gen;
+      if (_bgVideoOffGen == gen) {
+        _bgVideoOffGen = -1;
+        if (_inBackground && _startGen == gen) _disableVideoForBackground();
+      }
+    }
     applyVideoPictureParameters(player);
     if (_vodProxyPlatform && !isLive) {
       _logPlaybackStart();
@@ -1567,6 +1604,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       /// playing
       stream.playing.listen((bool playing) {
         if (playing) {
+          _startGen = -1;
           playerStatus = .playing;
           _stopWakeLockTimer();
           _updatePlaybackState();
@@ -2696,9 +2734,42 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return true;
   }
 
+  bool get _inBackground =>
+      _lastAppLifecycleState == AppLifecycleState.paused ||
+      _lastAppLifecycleState == AppLifecycleState.hidden;
+
+  bool _canStartAudioOnlyInBackground() {
+    if (!_autoPlay || isLive) return false;
+    if (!PlatformUtils.isMobile) return false;
+    if (!Pref.autoAudioOnlyInBackground) return false;
+    if (!continuePlayInBackground.value) return false;
+    if (isPipMode) return false;
+    if (_autoAudioState != AutoAudioOnlyState.idle &&
+        _autoAudioState != AutoAudioOnlyState.arm) {
+      return false;
+    }
+    if (Get.currentRoute == '/audio') return false;
+    return _hasIndependentAudioTrack;
+  }
+
+  /// 已打开的 EDL Media 关掉视频轨，回前台时 vid=auto 即可恢复
+  void _disableVideoForBackground() {
+    try {
+      _videoPlayerController?.setProperty('file-local-options/vid', 'no');
+    } catch (_) {
+      return;
+    }
+    _cancelAutoAudioOnlyTimer();
+    onlyPlayAudio.value = true;
+    _audioReopened = false;
+    _autoAudioState = AutoAudioOnlyState.autoAudioOnly;
+    VodProxyLog.play('bg-start audio-only after open');
+  }
+
   bool get _hasIndependentAudioTrack {
     if (dataSource is FileSource) {
-      return !(dataSource as FileSource).isMp4;
+      return !(dataSource as FileSource).isMp4 &&
+          dataSource.audioSource?.isNotEmpty == true;
     }
     return dataSource.audioSource?.isNotEmpty == true;
   }
@@ -2931,6 +3002,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         }
         if (isPipMode) {
           _autoAudioState = AutoAudioOnlyState.pipHold;
+        } else if ((_startGen == _sourceGen ||
+                (_openedGen == _sourceGen && !_diag.firstFrameSeen)) &&
+            _canStartAudioOnlyInBackground()) {
+          // 起播前切到后台：不等 10 秒，按当前进度切只听
+          if (_openedGen == _sourceGen) {
+            _disableVideoForBackground();
+          } else if (_committedGen == _sourceGen) {
+            // 正在 open：完成后再关视频轨
+            _bgVideoOffGen = _sourceGen;
+          }
+          // 尚未选定 Media：打开时会检测到后台并只打开音频
         } else if (_canEnterAutoAudioOnly()) {
           _autoAudioOnlyTimer = Timer(
             const Duration(seconds: 10),
@@ -2940,6 +3022,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
         }
         break;
       case AppLifecycleState.resumed:
+        _bgVideoOffGen = -1;
         if (_vodProxyPlatform && !isLive) {
           if (Platform.isIOS) unawaited(VodHttpProxy.instance.verifyListener());
           VodHttpProxy.instance.resumeStats();
@@ -3015,6 +3098,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _autoAudioState = AutoAudioOnlyState.idle;
     _audioReopened = false;
     _lastAppLifecycleState = null;
+    _startGen = _committedGen = _openedGen = _bgVideoOffGen = -1;
     // 每次减1，最后销毁
     resetScreenRotation();
     cancelLongPressTimer();
