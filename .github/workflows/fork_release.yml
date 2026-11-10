@@ -218,6 +218,12 @@ jobs:
     needs: [sync, android, ios]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          sparse-checkout: .github/scripts
+
       - name: Download builds
         uses: actions/download-artifact@v5
         with:
@@ -239,7 +245,17 @@ jobs:
 
           - Android: pick the APK matching your device (arm64-v8a for most phones)
           - iOS / iPadOS: unsigned IPA, install with SideStore / AltStore
+          - SideStore source (auto-updates): https://github.com/${{ github.repository }}/releases/latest/download/source.json
           EOF
+
+      - name: SideStore source
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          ipa=$(ls dist/*_ios.ipa)
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$(basename "$ipa")"
+          python3 -I .github/scripts/make_sidestore_source.py "$ipa" "$url" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" dist/source.json
+          cat dist/source.json
 
       - name: Publish
         uses: softprops/action-gh-release@v3
